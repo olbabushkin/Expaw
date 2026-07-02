@@ -1,0 +1,58 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    mem_limit: 512m
+
+  migrate:
+    build: .
+    command: python -m db.migrate
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  userbot:
+    build: .
+    command: python -m userbot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      # session-файл генерируется локально (python -m userbot.login), права 600,
+      # каталог вне git
+      - ./data/session:/session
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    mem_limit: 256m
+
+  bot:
+    build: .
+    command: python -m bot
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    mem_limit: 256m
+
+  worker:
+    build: .
+    command: python -m worker
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    mem_limit: 256m
