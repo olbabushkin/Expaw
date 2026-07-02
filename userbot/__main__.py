@@ -143,6 +143,15 @@ async def process_joins(client: TelegramClient, pool: asyncpg.Pool) -> None:
             chat_id,
             getattr(entity, "title", None),
         )
+        # Точка отсчёта: сохраняем последнее сообщение чата, чтобы страховочная
+        # сверка (min_id от максимального сохранённого id) не утянула историю
+        # до вступления. Мониторим только то, что написано после добавления.
+        try:
+            latest = await client.get_messages(entity, limit=1)
+            if latest:
+                await save_message(pool, chat_id, latest[0])
+        except Exception:
+            log.exception("failed to save join baseline message")
         await db.system_event(pool, f"✅ Вступил в чат «{getattr(entity, 'title', row['username'])}»")
         log.info(f"joined chat {chat_id}")
     except FloodWaitError:

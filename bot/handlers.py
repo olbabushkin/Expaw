@@ -50,7 +50,8 @@ async def cmd_start(message: Message):
     await message.answer(
         "Команды:\n"
         "/add_chat &lt;@username|ссылка&gt; — добавить чат-источник\n"
-        "/remove_chat &lt;@username|id&gt; — убрать чат\n"
+        "/remove_chat &lt;@username|id&gt; — выйти из чата (данные остаются)\n"
+        "/purge_chat &lt;@username|id&gt; — удалить чат со всеми его данными\n"
         "/list_chats — список чатов\n"
         "/add_intent &lt;code&gt; &lt;название&gt; — создать интент (+топик)\n"
         "/set_prompt &lt;code&gt; &lt;текст&gt; — критерии для LLM (префильтр подберётся сам)\n"
@@ -128,6 +129,54 @@ async def cmd_remove_chat(message: Message, command: CommandObject, pool: asyncp
     )
     await db.audit(pool, message.from_user.id, "remove_chat", {"arg": arg})
     await message.answer("Ок, юзербот выйдет из чата." if new_status == "leaving" else "Убрал из списка.")
+
+
+@router.message(Command("purge_chat"))
+async def cmd_purge_chat(message: Message, command: CommandObject, pool: asyncpg.Pool):
+    if not command.args:
+        await message.answer("Использование: /purge_chat @username или chat_id")
+        return
+    arg = command.args.strip().lstrip("@")
+    row = await pool.fetchrow(
+        """
+        SELECT id, chat_id, title, status FROM source_chats
+        WHERE username = $1 OR chat_id::text = $1 OR id::text = $1
+        """,
+        arg,
+    )
+    if row is None:
+        await message.answer("Чат не найден.")
+        return
+    if row["status"] in ("active", "leaving"):
+        await message.answer(
+            "Чат ещё активен. Сначала /remove_chat — юзербот выйдет из него, "
+            "потом можно /purge_chat."
+        )
+        return
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            if row["chat_id"] is not None:
+                deleted = await conn.fetchval(
+                    """
+                    WITH del_matches AS (
+                        DELETE FROM matches WHERE message_id IN
+                            (SELECT id FROM messages WHERE chat_id = $1)
+                    ),
+                    del_messages AS (
+                        DELETE FROM messages WHERE chat_id = $1 RETURNING id
+                    )
+                    SELECT count(*) FROM del_messages
+                    """,
+                    row["chat_id"],
+                )
+            else:
+                deleted = 0
+            await conn.execute("DELETE FROM source_chats WHERE id = $1", row["id"])
+    await db.audit(pool, message.from_user.id, "purge_chat", {"arg": arg, "messages": deleted})
+    await message.answer(
+        f"🗑 Чат «{html.escape(row['title'] or arg)}» удалён полностью "
+        f"(сообщений стёрто: {deleted})."
+    )
 
 
 @router.message(Command("list_chats"))
