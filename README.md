@@ -44,16 +44,39 @@ Redis/Celery); бот публикует `matches WHERE published_at IS NULL`.
    ⚠️ Session-файл = полный доступ к аккаунту: не коммитить (в `.gitignore`),
    права 600, каталог `data/` монтируется volume'ом.
 
-## Запуск
+## Деплой (CI/CD)
 
-```bash
-docker compose up -d --build
-```
+Пуш в `main` → GitHub Actions: syntax-check → rsync кода на сервер →
+`docker compose up -d --build` → health check. Ручной запуск — кнопка
+Run workflow во вкладке Actions.
 
-Миграции применяются автоматически (сервис `migrate`), затем стартуют
-`userbot`, `bot`, `worker` с `restart: unless-stopped`. Убийство любого
+**Настройка один раз:**
+
+1. На сервере (Ubuntu, под root):
+
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/main/deploy/setup-server.sh | bash
+   ```
+
+   Скрипт ставит Docker и rsync, создаёт пользователя `deploy`, каталог
+   `/opt/expaw` и SSH-ключ для Actions; в конце печатает, что куда положить.
+
+2. В GitHub: Settings → Secrets and variables → Actions:
+   - `SSH_HOST` — IP сервера
+   - `SSH_USER` — `deploy`
+   - `SSH_KEY` — приватный ключ из `/home/deploy/.ssh/github_actions`
+   - `SSH_PORT` — опционально, по умолчанию 22
+
+3. На сервер положить `/opt/expaw/.env` (из `.env.example`) и
+   `/opt/expaw/data/session/userbot.session` (сгенерирован локально).
+
+`.env` и `data/` (сессия + данные Postgres) деплоем **не трогаются** —
+rsync их исключает. Миграции применяются автоматически (сервис `migrate`,
+идемпотентен), пересобираются только изменившиеся сервисы. Убийство любого
 контейнера самовосстанавливается без потери сообщений (`catch_up=True` +
 страховочная сверка).
+
+Локальный запуск без CI — те же два файла + `docker compose up -d --build`.
 
 ## Использование
 
