@@ -29,6 +29,20 @@ def build_link(username: str | None, chat_id: int, tg_msg_id: int) -> str:
     return f"https://t.me/c/{internal}/{tg_msg_id}"
 
 
+def format_age(tg_date: datetime | None) -> str:
+    """Сколько прошло с публикации оригинала: «50 мин назад», «5 дн назад»."""
+    if tg_date is None:
+        return ""
+    minutes = (datetime.now(timezone.utc) - tg_date).total_seconds() / 60
+    if minutes < 1:
+        return "только что"
+    if minutes < 60:
+        return f"{int(minutes)} мин назад"
+    if minutes < 60 * 24:
+        return f"{int(minutes // 60)} ч назад"
+    return f"{int(minutes // (60 * 24))} дн назад"
+
+
 def format_post(row: asyncpg.Record) -> str:
     text = row["text"] or ""
     if len(text) > TEXT_LIMIT:
@@ -36,10 +50,12 @@ def format_post(row: asyncpg.Record) -> str:
     link = build_link(row["username"], row["chat_id"], row["tg_msg_id"])
     source = row["chat_title"] or (f"@{row['username']}" if row["username"] else "чат")
     author = f" · автор: <code>{row['sender_id']}</code>" if row["sender_id"] else ""
+    age = format_age(row["tg_date"])
+    age_part = f" · 🕐 {age}" if age else ""
     return (
         f"{html.escape(text)}\n\n"
-        f"📍 <a href=\"{link}\">Оригинал</a> · {html.escape(source)}{author} "
-        f"· score {row['score']:.2f}"
+        f"📍 <a href=\"{link}\">Оригинал</a> · {html.escape(source)}{author}"
+        f"{age_part} · score {row['score']:.2f}"
     )
 
 
@@ -71,7 +87,7 @@ async def publish_loop(bot: Bot, pool: asyncpg.Pool) -> None:
             rows = await pool.fetch(
                 """
                 SELECT mt.id AS match_id, mt.score,
-                       m.text, m.sender_id, m.tg_msg_id, m.chat_id,
+                       m.text, m.sender_id, m.tg_msg_id, m.chat_id, m.tg_date,
                        i.topic_id, i.code,
                        c.username, c.title AS chat_title
                 FROM matches mt

@@ -11,7 +11,7 @@ from aiogram.filters import Command, CommandObject
 from aiogram.types import Message, MessageReactionUpdated
 
 from bot.keywords import suggest_keywords
-from bot.tuning import maybe_autotune, run_tune
+from bot.tuning import backtest_report, maybe_autotune, run_tune
 from common import db
 from common.config import settings
 from common.log import setup
@@ -515,7 +515,8 @@ async def cmd_tune_prompt(message: Message, command: CommandObject, pool: asyncp
         await message.answer("Использование: /tune_prompt <code>")
         return
     intent = await pool.fetchrow(
-        "SELECT id, code, title, llm_prompt, prefilter FROM intents WHERE code = $1", code
+        "SELECT id, code, title, llm_prompt, prefilter, threshold FROM intents WHERE code = $1",
+        code,
     )
     if intent is None:
         await message.answer("Интент не найден.")
@@ -523,7 +524,10 @@ async def cmd_tune_prompt(message: Message, command: CommandObject, pool: asyncp
     if not intent["llm_prompt"]:
         await message.answer(f"Сначала задай критерии: /set_prompt {code} ...")
         return
-    await message.answer("Улучшаю критерии и префильтр по фидбеку…")
+    await message.answer(
+        "Улучшаю критерии и проверяю их бэктестом на размеченных сообщениях "
+        "(может занять минуту)…"
+    )
     try:
         res = await run_tune(pool, intent)
     except ValueError:
@@ -536,7 +540,19 @@ async def cmd_tune_prompt(message: Message, command: CommandObject, pool: asyncp
         log.exception("tune failed")
         await message.answer(f"⚠️ Не получилось: {html.escape(str(exc)[:100])}")
         return
-    await db.audit(pool, message.from_user.id, "tune_prompt", {"code": code})
+    await db.audit(
+        pool, message.from_user.id, "tune_prompt", {"code": code, "applied": res["applied"]}
+    )
+    if not res["applied"]:
+        await message.answer(
+            f"⛔ Новая версия критериев теряет {res['backtest']['lost']} "
+            f"подтверждённых совпадений — НЕ применил, действующие критерии "
+            f"не тронуты.\n\n{backtest_report(res)}\n\n"
+            f"Предлагалось:\n<i>{html.escape(res['prompt'])}</i>\n\n"
+            f"Можно повторить (/tune_prompt {code}) — генерация недетерминирована, "
+            f"или поправить руками: /set_prompt {code} ..."
+        )
+        return
     added = ", ".join(res["added"]) if res["added"] else "без изменений"
     warn = (
         f"\n⚠️ {res['uncovered']} подтверждённых сообщений не покрыты префильтром — "
@@ -545,7 +561,7 @@ async def cmd_tune_prompt(message: Message, command: CommandObject, pool: asyncp
         else ""
     )
     await message.answer(
-        f"✅ По выборке 👍{res['likes']}/👎{res['dislikes']}:\n\n"
+        f"✅ Применил новые критерии.\n\n{backtest_report(res)}\n\n"
         f"Критерии:\n<i>{html.escape(res['prompt'])}</i>\n\n"
         f"Префильтр (+{len(res['added'])}, всего {res['total_prefilter']}): "
         f"<code>{html.escape(added)}</code>{warn}\n\n"
