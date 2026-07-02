@@ -1,5 +1,6 @@
 """Команды управляющего бота. Все команды — только для админов из whitelist."""
 
+import asyncio
 import html
 import re
 
@@ -7,9 +8,9 @@ import asyncpg
 from aiogram import Bot, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject
-from aiogram.types import Message
+from aiogram.types import Message, MessageReactionUpdated
 
-from bot.keywords import suggest_keywords
+from bot.keywords import improve_prompt, suggest_keywords
 from common import db
 from common.config import settings
 from common.log import setup
@@ -26,6 +27,41 @@ async def admin_only(handler, event: Message, data):
             await event.answer("⛔ Доступ запрещён.")
         return None
     return await handler(event, data)
+
+
+# Реакции на посты в топиках — обратная связь для тюнинга промптов.
+# Ставить может кто угодно в группе (не только админы), поэтому вне whitelist.
+@router.message_reaction()
+async def on_reaction(event: MessageReactionUpdated, pool: asyncpg.Pool):
+    if event.chat.id != settings.forum_chat_id:
+        return
+    match = await pool.fetchrow(
+        "SELECT message_id, intent_id FROM matches WHERE published_msg_id = $1",
+        event.message_id,
+    )
+    if match is None:
+        return
+    emojis = {r.emoji for r in event.new_reaction if r.type == "emoji"}
+    verdict = 1 if "👍" in emojis else -1 if "👎" in emojis else None
+    if verdict is None:
+        await pool.execute(
+            "DELETE FROM feedback WHERE message_id = $1 AND intent_id = $2",
+            match["message_id"],
+            match["intent_id"],
+        )
+        return
+    await pool.execute(
+        """
+        INSERT INTO feedback (message_id, intent_id, verdict, by_user)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (message_id, intent_id)
+        DO UPDATE SET verdict = EXCLUDED.verdict, by_user = EXCLUDED.by_user, created_at = now()
+        """,
+        match["message_id"],
+        match["intent_id"],
+        verdict,
+        event.user.id if event.user else None,
+    )
 
 
 _INVITE_RE = re.compile(r"(?:t\.me/(?:joinchat/|\+))([\w-]+)$")
@@ -60,8 +96,12 @@ async def cmd_start(message: Message):
         "/set_threshold &lt;code&gt; &lt;0..1&gt;\n"
         "/toggle_intent &lt;code&gt;\n"
         "/list_intents\n"
+        "/tune_prompt &lt;code&gt; — улучшить критерии по реакциям 👍/👎 на посты\n"
+        "/recalc — пересчитать все сообщения под новые промпты\n"
         "/stats — статистика за сутки\n"
-        "/retry_errors — перезапустить сообщения со статусом error"
+        "/retry_errors — перезапустить сообщения со статусом error\n\n"
+        "Реакции в топиках: 👍 на пост = совпадение верное, 👎 = ложное. "
+        "Это копится как обучающая выборка для /tune_prompt."
     )
 
 
@@ -159,7 +199,11 @@ async def cmd_purge_chat(message: Message, command: CommandObject, pool: asyncpg
             if row["chat_id"] is not None:
                 deleted = await conn.fetchval(
                     """
-                    WITH del_matches AS (
+                    WITH del_feedback AS (
+                        DELETE FROM feedback WHERE message_id IN
+                            (SELECT id FROM messages WHERE chat_id = $1)
+                    ),
+                    del_matches AS (
                         DELETE FROM matches WHERE message_id IN
                             (SELECT id FROM messages WHERE chat_id = $1)
                     ),
@@ -353,7 +397,15 @@ async def cmd_toggle_intent(message: Message, command: CommandObject, pool: asyn
 
 @router.message(Command("list_intents"))
 async def cmd_list_intents(message: Message, pool: asyncpg.Pool):
-    rows = await pool.fetch("SELECT * FROM intents ORDER BY id")
+    rows = await pool.fetch(
+        """
+        SELECT i.*,
+               count(f.id) FILTER (WHERE f.verdict = 1) AS likes,
+               count(f.id) FILTER (WHERE f.verdict = -1) AS dislikes
+        FROM intents i LEFT JOIN feedback f ON f.intent_id = i.id
+        GROUP BY i.id ORDER BY i.id
+        """
+    )
     if not rows:
         await message.answer("Интентов нет. /add_intent, чтобы создать.")
         return
@@ -364,7 +416,7 @@ async def cmd_list_intents(message: Message, pool: asyncpg.Pool):
         pf = f"{len(r['prefilter'])} шаблонов" if r["prefilter"] else "⚠️ нет префильтра"
         lines.append(
             f"{state} <b>{html.escape(r['code'])}</b> — {html.escape(r['title'])} "
-            f"(порог {r['threshold']:.2f}, {prompt_ok}, {pf})"
+            f"(порог {r['threshold']:.2f}, {prompt_ok}, {pf}, 👍{r['likes']}/👎{r['dislikes']})"
         )
     await message.answer("\n".join(lines))
 
@@ -400,6 +452,105 @@ async def cmd_stats(message: Message, pool: asyncpg.Pool):
     ]
     lines += [f"  {r['code']}: {r['cnt']}" for r in intent_rows] or ["  —"]
     await message.answer("\n".join(lines))
+
+
+@router.message(Command("tune_prompt"))
+async def cmd_tune_prompt(message: Message, command: CommandObject, pool: asyncpg.Pool):
+    code = (command.args or "").strip().lower()
+    if not code:
+        await message.answer("Использование: /tune_prompt <code>")
+        return
+    intent = await pool.fetchrow(
+        "SELECT id, title, llm_prompt FROM intents WHERE code = $1", code
+    )
+    if intent is None:
+        await message.answer("Интент не найден.")
+        return
+    if not intent["llm_prompt"]:
+        await message.answer(f"Сначала задай критерии: /set_prompt {code} ...")
+        return
+    rows = await pool.fetch(
+        """
+        SELECT f.verdict, m.text FROM feedback f
+        JOIN messages m ON m.id = f.message_id
+        WHERE f.intent_id = $1 AND m.text IS NOT NULL AND m.text != ''
+        ORDER BY f.created_at DESC LIMIT 30
+        """,
+        intent["id"],
+    )
+    false_positives = [r["text"] for r in rows if r["verdict"] == -1]
+    confirmed = [r["text"] for r in rows if r["verdict"] == 1]
+    if not false_positives and not confirmed:
+        await message.answer(
+            "Пока нет обратной связи. Ставь 👍 на верные посты и 👎 на ложные "
+            "срабатывания прямо в топиках — потом повтори команду."
+        )
+        return
+    await message.answer(
+        f"Улучшаю критерии по фидбеку: 👍 {len(confirmed)} · 👎 {len(false_positives)}…"
+    )
+    try:
+        new_prompt = await improve_prompt(
+            intent["title"], intent["llm_prompt"], false_positives, confirmed
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.exception("improve_prompt failed")
+        await message.answer(f"⚠️ Не получилось: {html.escape(str(exc)[:100])}")
+        return
+    await pool.execute(
+        "UPDATE intents SET llm_prompt = $2 WHERE id = $1", intent["id"], new_prompt
+    )
+    await db.audit(pool, message.from_user.id, "tune_prompt", {"code": code})
+    await message.answer(
+        f"✅ Критерии обновлены:\n\n<i>{html.escape(new_prompt)}</i>\n\n"
+        f"Дальше по желанию:\n"
+        f"/suggest_prefilter {code} — обновить ключевые слова\n"
+        f"/recalc — пересчитать все сообщения под новые критерии\n"
+        f"Откатить/поправить: /set_prompt {code} ..."
+    )
+
+
+@router.message(Command("recalc"))
+async def cmd_recalc(message: Message, command: CommandObject, pool: asyncpg.Pool, bot: Bot):
+    if (command.args or "").strip() != "confirm":
+        stats = await pool.fetchrow(
+            """
+            SELECT (SELECT count(*) FROM matches WHERE published_msg_id IS NOT NULL) AS posts,
+                   (SELECT count(*) FROM messages) AS msgs
+            """
+        )
+        await message.answer(
+            f"Пересчёт: удалю {stats['posts']} постов из топиков, очищу совпадения "
+            f"и прогоню все {stats['msgs']} сообщений заново через текущие "
+            f"промпты/префильтры (обратная связь 👍/👎 сохранится).\n\n"
+            f"Подтверждение: <code>/recalc confirm</code>"
+        )
+        return
+    rows = await pool.fetch(
+        "SELECT published_msg_id FROM matches WHERE published_msg_id IS NOT NULL"
+    )
+    await message.answer(f"Начал пересчёт: удаляю {len(rows)} постов…")
+    deleted = 0
+    for r in rows:
+        try:
+            await bot.delete_message(settings.forum_chat_id, r["published_msg_id"])
+            deleted += 1
+        except TelegramBadRequest:
+            pass  # пост уже удалён руками — не страшно
+        await asyncio.sleep(0.1)
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("DELETE FROM matches")
+            await conn.execute("DELETE FROM published_hashes")
+            reset = await conn.execute(
+                "UPDATE messages SET status = 'new', intent_candidates = NULL, error = NULL"
+            )
+    await db.audit(pool, message.from_user.id, "recalc", {"deleted_posts": deleted})
+    await message.answer(
+        f"🔄 Готово: постов удалено {deleted}, в очередь на пересчёт вернул "
+        f"{reset.split()[-1]} сообщений. Совпадения будут появляться в топиках "
+        f"по мере обработки — следи за /stats."
+    )
 
 
 @router.message(Command("retry_errors"))

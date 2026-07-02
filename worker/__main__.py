@@ -68,22 +68,29 @@ async def classify_one(conn: asyncpg.Connection, row: asyncpg.Record, intents: l
         await conn.execute("UPDATE messages SET status = 'skipped' WHERE id = $1", row["id"])
         return
     result = await classify(row["text"], candidates)
+    # Сообщение относится максимум к одному интенту: модель просят выбрать
+    # лучший, но на случай нескольких match=true страхуемся выбором по score.
+    passed = []
     for item in result.get("results", []):
         intent = by_code.get(item.get("intent_code"))
         if intent is None:
             continue
-        if item.get("match") and float(item.get("confidence", 0)) >= intent["threshold"]:
-            await conn.execute(
-                """
-                INSERT INTO matches (message_id, intent_id, score, llm_response)
-                VALUES ($1, $2, $3, $4)
-                ON CONFLICT (message_id, intent_id) DO NOTHING
-                """,
-                row["id"],
-                intent["id"],
-                float(item["confidence"]),
-                result,  # полный ответ LLM — пригодится для тюнинга промптов
-            )
+        confidence = float(item.get("confidence", 0))
+        if item.get("match") and confidence >= intent["threshold"]:
+            passed.append((confidence, intent))
+    if passed:
+        confidence, intent = max(passed, key=lambda p: p[0])
+        await conn.execute(
+            """
+            INSERT INTO matches (message_id, intent_id, score, llm_response)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (message_id, intent_id) DO NOTHING
+            """,
+            row["id"],
+            intent["id"],
+            confidence,
+            result,  # полный ответ LLM — пригодится для тюнинга промптов
+        )
     await conn.execute("UPDATE messages SET status = 'classified' WHERE id = $1", row["id"])
 
 

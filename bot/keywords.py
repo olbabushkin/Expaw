@@ -35,6 +35,47 @@ _SYSTEM = (
 )
 
 
+_TUNE_SCHEMA = {
+    "type": "object",
+    "properties": {"prompt": {"type": "string"}},
+    "required": ["prompt"],
+    "additionalProperties": False,
+}
+
+_TUNE_SYSTEM = (
+    "Ты улучшаешь критерии интента для классификатора сообщений из Telegram-чатов. "
+    "Тебе дают текущие критерии и размеченные админом примеры: ложные срабатывания "
+    "(классификатор ошибочно посчитал сообщение подходящим) и подтверждённые "
+    "совпадения. Перепиши критерии так, чтобы исключить подобные ложные "
+    "срабатывания, но сохранить все подтверждённые. Добавь явные исключения "
+    "(«Не подходит: ...») по мотивам ошибок. Критерии — сжатый текст на русском, "
+    "без вступлений и пояснений, не длиннее ~120 слов."
+)
+
+
+async def improve_prompt(
+    title: str, current: str, false_positives: list[str], confirmed: list[str]
+) -> str:
+    def block(items: list[str]) -> str:
+        return "\n".join(f"- {t[:300]}" for t in items) or "- (нет примеров)"
+
+    user = (
+        f"Интент: {title}\n\nТекущие критерии:\n{current}\n\n"
+        f"Ложные срабатывания (дизлайки):\n{block(false_positives)}\n\n"
+        f"Подтверждённые совпадения (лайки):\n{block(confirmed)}\n\n"
+        "Верни улучшенные критерии."
+    )
+    response = await _client.messages.create(
+        model=settings.llm_model,
+        max_tokens=800,
+        system=_TUNE_SYSTEM,
+        messages=[{"role": "user", "content": user}],
+        output_config={"format": {"type": "json_schema", "schema": _TUNE_SCHEMA}},
+    )
+    raw = next(b.text for b in response.content if b.type == "text")
+    return json.loads(raw)["prompt"].strip()
+
+
 async def suggest_keywords(title: str, criteria: str) -> list[str]:
     response = await _client.messages.create(
         model=settings.llm_model,
