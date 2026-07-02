@@ -34,10 +34,7 @@ class Settings:
     llm_model: str = os.environ.get("LLM_MODEL", "claude-haiku-4-5")
     min_text_len: int = _int("MIN_TEXT_LEN", 20)
 
-    # лимиты юзербота
-    join_daily_limit: int = _int("JOIN_DAILY_LIMIT", 8)
-    join_min_delay_min: int = _int("JOIN_MIN_DELAY_MIN", 5)
-    join_max_delay_min: int = _int("JOIN_MAX_DELAY_MIN", 15)
+    # страховочная сверка юзербота
     sync_interval_min: int = _int("SYNC_INTERVAL_MIN", 120)
     sync_chat_pause_sec: int = _int("SYNC_CHAT_PAUSE_SEC", 8)
 

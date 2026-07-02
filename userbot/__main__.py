@@ -1,18 +1,23 @@
 """Юзербот-слушатель: push через MTProto, менеджер пула чатов, страховочная сверка.
 
-Связь с ботом — только через БД: бот ставит статусы-задачи (pending_join /
-leaving), юзербот их исполняет и пишет результат.
+Аккаунт юзербота САМ НИКУДА НЕ ВСТУПАЕТ И НЕ ВЫХОДИТ: владелец вступает в чаты
+сам, менеджер пула лишь проверяет членство и включает мониторинг. Связь с ботом —
+только через БД (статусы pending_join / active / left).
 """
 
 import asyncio
-import random
-from datetime import datetime, timedelta, timezone
+import time
 
 import asyncpg
 from telethon import TelegramClient, events, utils
-from telethon.errors import FloodWaitError, UserAlreadyParticipantError
-from telethon.tl.functions.channels import JoinChannelRequest, LeaveChannelRequest
-from telethon.tl.functions.messages import ImportChatInviteRequest
+from telethon.errors import (
+    ChannelPrivateError,
+    FloodWaitError,
+    UserNotParticipantError,
+)
+from telethon.tl.functions.channels import GetParticipantRequest
+from telethon.tl.functions.messages import CheckChatInviteRequest
+from telethon.tl.types import ChatInviteAlready
 
 from common import db
 from common.config import settings
@@ -93,113 +98,88 @@ async def refresh_active_chats(pool: asyncpg.Pool) -> None:
     active_chats.update(r["chat_id"] for r in rows)
 
 
-async def _join_allowed(pool: asyncpg.Pool) -> bool:
-    """Консервативные лимиты: не больше N join в сутки, пауза 5–15 мин между ними."""
-    row = await pool.fetchrow(
-        """
-        SELECT count(*) FILTER (WHERE joined_at > now() - interval '24 hours') AS day_cnt,
-               max(joined_at) AS last_join
-        FROM source_chats
-        """
-    )
-    if row["day_cnt"] >= settings.join_daily_limit:
-        return False
-    if row["last_join"] is not None:
-        delay = timedelta(
-            minutes=random.uniform(settings.join_min_delay_min, settings.join_max_delay_min)
-        )
-        if datetime.now(timezone.utc) - row["last_join"] < delay:
-            return False
-    return True
+# Троттлинг проверок членства: не чаще раза в N секунд на чат,
+# чтобы не дёргать resolve/GetParticipant слишком часто.
+MEMBERSHIP_CHECK_EVERY_SEC = 300
+_last_check: dict[int, float] = {}
 
 
-async def process_joins(client: TelegramClient, pool: asyncpg.Pool) -> None:
-    if not await _join_allowed(pool):
-        return
-    row = await pool.fetchrow(
-        "SELECT id, username, invite_hash FROM source_chats "
-        "WHERE status = 'pending_join' ORDER BY created_at LIMIT 1"
-    )
-    if row is None:
-        return
+async def _member_entity(client: TelegramClient, row: asyncpg.Record):
+    """Возвращает entity чата, если аккаунт уже состоит в нём, иначе None."""
+    if row["invite_hash"]:
+        result = await client(CheckChatInviteRequest(row["invite_hash"]))
+        return result.chat if isinstance(result, ChatInviteAlready) else None
     try:
-        if row["invite_hash"]:
-            try:
-                updates = await client(ImportChatInviteRequest(row["invite_hash"]))
-                entity = updates.chats[0]
-            except UserAlreadyParticipantError:
-                entity = await client.get_entity(f"https://t.me/+{row['invite_hash']}")
-        else:
-            entity = await client.get_entity(row["username"])
-            await client(JoinChannelRequest(entity))
-        chat_id = utils.get_peer_id(entity)
-        await pool.execute(
-            """
-            UPDATE source_chats
-            SET chat_id = $2, title = $3, status = 'active', joined_at = now(), last_error = NULL
-            WHERE id = $1
-            """,
-            row["id"],
-            chat_id,
-            getattr(entity, "title", None),
-        )
-        # Точка отсчёта: сохраняем последнее сообщение чата, чтобы страховочная
-        # сверка (min_id от максимального сохранённого id) не утянула историю
-        # до вступления. Мониторим только то, что написано после добавления.
-        try:
-            latest = await client.get_messages(entity, limit=1)
-            if latest:
-                await save_message(pool, chat_id, latest[0])
-        except Exception:
-            log.exception("failed to save join baseline message")
-        await db.system_event(pool, f"✅ Вступил в чат «{getattr(entity, 'title', row['username'])}»")
-        log.info(f"joined chat {chat_id}")
-    except FloodWaitError:
-        raise  # обрабатывается глобально в pool_manager
-    except Exception as exc:  # noqa: BLE001
-        await pool.execute(
-            "UPDATE source_chats SET status = 'error', last_error = $2 WHERE id = $1",
-            row["id"],
-            str(exc),
-        )
-        await db.system_event(
-            pool,
-            f"⚠️ Не удалось вступить в чат {row['username'] or row['invite_hash']}: {exc}",
-            level="error",
-        )
-        log.warning(f"join failed: {exc}")
+        entity = await client.get_entity(row["username"])
+        await client(GetParticipantRequest(entity, "me"))
+        return entity
+    except (UserNotParticipantError, ChannelPrivateError):
+        return None
 
 
-async def process_leaves(client: TelegramClient, pool: asyncpg.Pool) -> None:
+async def process_pending(client: TelegramClient, pool: asyncpg.Pool) -> None:
+    """pending_join → active, как только владелец сам вступил в чат.
+
+    Юзербот НЕ вступает в чаты — только проверяет членство.
+    """
     rows = await pool.fetch(
-        "SELECT id, chat_id, title FROM source_chats WHERE status = 'leaving'"
+        "SELECT id, username, invite_hash FROM source_chats "
+        "WHERE status = 'pending_join' ORDER BY created_at"
     )
+    now = time.monotonic()
     for row in rows:
+        if now - _last_check.get(row["id"], 0) < MEMBERSHIP_CHECK_EVERY_SEC:
+            continue
+        _last_check[row["id"]] = now
         try:
-            if row["chat_id"] is not None:
-                await client(LeaveChannelRequest(await client.get_entity(row["chat_id"])))
+            entity = await _member_entity(client, row)
+            if entity is None:
+                continue  # ждём, пока владелец вступит сам
+            chat_id = utils.get_peer_id(entity)
             await pool.execute(
-                "UPDATE source_chats SET status = 'left' WHERE id = $1", row["id"]
+                """
+                UPDATE source_chats
+                SET chat_id = $2, title = $3, status = 'active', joined_at = now(), last_error = NULL
+                WHERE id = $1
+                """,
+                row["id"],
+                chat_id,
+                getattr(entity, "title", None),
             )
-            await db.system_event(pool, f"🚪 Вышел из чата «{row['title'] or row['id']}»")
+            # Точка отсчёта: сохраняем последнее сообщение чата, чтобы страховочная
+            # сверка не утянула историю до включения мониторинга.
+            try:
+                latest = await client.get_messages(entity, limit=1)
+                if latest:
+                    await save_message(pool, chat_id, latest[0])
+            except Exception:
+                log.exception("failed to save baseline message")
+            await db.system_event(
+                pool, f"✅ Начал мониторить «{getattr(entity, 'title', row['username'])}»"
+            )
+            log.info(f"monitoring chat {chat_id}")
         except FloodWaitError:
-            raise
-        except Exception as exc:  # noqa: BLE001
+            raise  # обрабатывается глобально в pool_manager
+        except Exception as exc:  # noqa: BLE001 — битый username/ссылка и т.п.
             await pool.execute(
                 "UPDATE source_chats SET status = 'error', last_error = $2 WHERE id = $1",
                 row["id"],
                 str(exc),
             )
-            log.warning(f"leave failed: {exc}")
+            await db.system_event(
+                pool,
+                f"⚠️ Не удалось проверить чат {row['username'] or row['invite_hash']}: {exc}",
+                level="error",
+            )
+            log.warning(f"membership check failed: {exc}")
 
 
 async def pool_manager(client: TelegramClient, pool: asyncpg.Pool) -> None:
-    """Фоновая корутина: join/leave-задачи из БД + кэш активных чатов + heartbeat."""
+    """Фоновая корутина: проверка членства в pending-чатах + кэш активных + heartbeat."""
     while True:
         try:
             await refresh_active_chats(pool)
-            await process_leaves(client, pool)
-            await process_joins(client, pool)
+            await process_pending(client, pool)
             await db.heartbeat(pool, SERVICE)
         except FloodWaitError as exc:
             wait = exc.seconds

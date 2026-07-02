@@ -49,8 +49,8 @@ def parse_chat_ref(arg: str) -> tuple[str | None, str | None]:
 async def cmd_start(message: Message):
     await message.answer(
         "Команды:\n"
-        "/add_chat &lt;@username|ссылка&gt; — добавить чат-источник\n"
-        "/remove_chat &lt;@username|id&gt; — выйти из чата (данные остаются)\n"
+        "/add_chat &lt;@username|ссылка&gt; — отслеживать чат (вступи в него сам)\n"
+        "/remove_chat &lt;@username|id&gt; — перестать отслеживать (без выхода из чата)\n"
         "/purge_chat &lt;@username|id&gt; — удалить чат со всеми его данными\n"
         "/list_chats — список чатов\n"
         "/add_intent &lt;code&gt; &lt;название&gt; — создать интент (+топик)\n"
@@ -101,8 +101,9 @@ async def cmd_add_chat(message: Message, command: CommandObject, pool: asyncpg.P
     )
     await db.audit(pool, message.from_user.id, "add_chat", {"arg": command.args})
     await message.answer(
-        "Поставил в очередь на вступление. Юзербот вступает с задержками "
-        f"(лимит {settings.join_daily_limit}/сутки) — следи за /list_chats."
+        "Добавил в список. Сам никого никуда не вступаю: зайди в этот чат со "
+        "своего аккаунта (если ещё не там) — мониторинг включится автоматически "
+        "в течение ~5 минут. Статус: /list_chats"
     )
 
 
@@ -114,7 +115,7 @@ async def cmd_remove_chat(message: Message, command: CommandObject, pool: asyncp
     arg = command.args.strip().lstrip("@")
     row = await pool.fetchrow(
         """
-        SELECT id, status FROM source_chats
+        SELECT id, title FROM source_chats
         WHERE username = $1 OR chat_id::text = $1 OR id::text = $1
         """,
         arg,
@@ -122,13 +123,14 @@ async def cmd_remove_chat(message: Message, command: CommandObject, pool: asyncp
     if row is None:
         await message.answer("Чат не найден.")
         return
-    # pending_join ещё не вступили — просто помечаем left; активные — задача юзерботу.
-    new_status = "leaving" if row["status"] == "active" else "left"
     await pool.execute(
-        "UPDATE source_chats SET status = $2 WHERE id = $1", row["id"], new_status
+        "UPDATE source_chats SET status = 'left' WHERE id = $1", row["id"]
     )
     await db.audit(pool, message.from_user.id, "remove_chat", {"arg": arg})
-    await message.answer("Ок, юзербот выйдет из чата." if new_status == "leaving" else "Убрал из списка.")
+    await message.answer(
+        f"Перестал отслеживать «{html.escape(row['title'] or arg)}». "
+        "Из чата не выходил — это твой аккаунт. Данные остались; стереть их: /purge_chat"
+    )
 
 
 @router.message(Command("purge_chat"))
@@ -147,10 +149,9 @@ async def cmd_purge_chat(message: Message, command: CommandObject, pool: asyncpg
     if row is None:
         await message.answer("Чат не найден.")
         return
-    if row["status"] in ("active", "leaving"):
+    if row["status"] == "active":
         await message.answer(
-            "Чат ещё активен. Сначала /remove_chat — юзербот выйдет из него, "
-            "потом можно /purge_chat."
+            "Чат ещё отслеживается. Сначала /remove_chat, потом /purge_chat."
         )
         return
     async with pool.acquire() as conn:
@@ -193,7 +194,7 @@ async def cmd_list_chats(message: Message, pool: asyncpg.Pool):
     if not rows:
         await message.answer("Список чатов пуст. /add_chat, чтобы добавить.")
         return
-    icons = {"active": "🟢", "pending_join": "⏳", "leaving": "🚪", "error": "❌"}
+    icons = {"active": "🟢", "pending_join": "⏳ (вступи в чат)", "error": "❌"}
     lines = []
     for r in rows:
         name = html.escape(r["title"] or (f"@{r['username']}" if r["username"] else "invite-link"))
