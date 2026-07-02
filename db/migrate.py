@@ -13,9 +13,25 @@ from common.config import settings
 
 MIGRATIONS_DIR = pathlib.Path(__file__).parent / "migrations"
 
+CONNECT_ATTEMPTS = 15
+CONNECT_RETRY_SEC = 2
+
+
+async def _connect() -> asyncpg.Connection:
+    """При первом старте Postgres перезапускается после initdb — ждём его."""
+    for attempt in range(1, CONNECT_ATTEMPTS + 1):
+        try:
+            return await asyncpg.connect(settings.database_url)
+        except (OSError, asyncpg.PostgresError) as exc:
+            if attempt == CONNECT_ATTEMPTS:
+                raise
+            print(f"db not ready ({exc}), retry {attempt}/{CONNECT_ATTEMPTS}")
+            await asyncio.sleep(CONNECT_RETRY_SEC)
+    raise AssertionError("unreachable")
+
 
 async def main() -> None:
-    conn = await asyncpg.connect(settings.database_url)
+    conn = await _connect()
     try:
         await conn.execute(
             """
