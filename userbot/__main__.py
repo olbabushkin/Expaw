@@ -7,6 +7,7 @@
 
 import asyncio
 import time
+from datetime import datetime, timedelta, timezone
 
 import asyncpg
 from telethon import TelegramClient, events, utils
@@ -146,17 +147,22 @@ async def process_pending(client: TelegramClient, pool: asyncpg.Pool) -> None:
                 chat_id,
                 getattr(entity, "title", None),
             )
-            # Точка отсчёта: сохраняем последнее сообщение чата, чтобы страховочная
-            # сверка не утянула историю до включения мониторинга.
-            try:
-                latest = await client.get_messages(entity, limit=1)
-                if latest:
-                    await save_message(pool, chat_id, latest[0])
-            except Exception:
-                log.exception("failed to save baseline message")
-            await db.system_event(
-                pool, f"✅ Начал мониторить «{getattr(entity, 'title', row['username'])}»"
-            )
+            title = getattr(entity, "title", row["username"])
+            if settings.backfill_days > 0:
+                # История подтянет и точку отсчёта для страховочной сверки
+                asyncio.create_task(
+                    backfill_history(client, pool, chat_id, entity, title)
+                )
+            else:
+                # Точка отсчёта: последнее сообщение, чтобы сверка не утянула
+                # историю до включения мониторинга.
+                try:
+                    latest = await client.get_messages(entity, limit=1)
+                    if latest:
+                        await save_message(pool, chat_id, latest[0])
+                except Exception:
+                    log.exception("failed to save baseline message")
+            await db.system_event(pool, f"✅ Начал мониторить «{title}»")
             log.info(f"monitoring chat {chat_id}")
         except FloodWaitError:
             raise  # обрабатывается глобально в pool_manager
@@ -172,6 +178,45 @@ async def process_pending(client: TelegramClient, pool: asyncpg.Pool) -> None:
                 level="error",
             )
             log.warning(f"membership check failed: {exc}")
+
+
+async def backfill_history(
+    client: TelegramClient, pool: asyncpg.Pool, chat_id: int, entity, title: str
+) -> None:
+    """Фоновая загрузка истории чата за BACKFILL_DAYS при включении мониторинга.
+
+    Идём от новых к старым до границы окна или лимита сообщений; сохранённые
+    сообщения проходят обычный пайплайн (префильтр -> LLM -> публикация).
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=settings.backfill_days)
+    saved = scanned = 0
+    try:
+        async for message in client.iter_messages(
+            entity, limit=settings.backfill_max_messages
+        ):
+            if message.date < cutoff:
+                break
+            scanned += 1
+            if await save_message(pool, chat_id, message):
+                saved += 1
+            if scanned % 200 == 0:
+                await asyncio.sleep(2)  # бережём лимиты на больших чатах
+        await db.system_event(
+            pool,
+            f"📥 «{title}»: загружена история за {settings.backfill_days} дн. — "
+            f"{saved} сообщений в обработку",
+        )
+        log.info(f"backfill for chat {chat_id}: saved {saved} of {scanned} scanned")
+    except FloodWaitError as exc:
+        await db.system_event(
+            pool,
+            f"⏳ FloodWait {exc.seconds}s при загрузке истории «{title}», "
+            f"успел сохранить {saved}",
+            level="warning",
+        )
+        log.warning(f"backfill flood wait {exc.seconds}s for chat {chat_id}")
+    except Exception:
+        log.exception(f"backfill failed for chat {chat_id}")
 
 
 async def pool_manager(client: TelegramClient, pool: asyncpg.Pool) -> None:

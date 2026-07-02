@@ -34,6 +34,10 @@ class Settings:
     llm_model: str = os.environ.get("LLM_MODEL", "claude-haiku-4-5")
     min_text_len: int = _int("MIN_TEXT_LEN", 20)
 
+    # история при подключении чата (0 = только новые сообщения)
+    backfill_days: int = _int("BACKFILL_DAYS", 30)
+    backfill_max_messages: int = _int("BACKFILL_MAX_MESSAGES", 3000)
+
     # страховочная сверка юзербота
     sync_interval_min: int = _int("SYNC_INTERVAL_MIN", 120)
     sync_chat_pause_sec: int = _int("SYNC_CHAT_PAUSE_SEC", 8)
