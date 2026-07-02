@@ -5,6 +5,7 @@ import re
 
 import asyncpg
 from aiogram import Bot, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject
 from aiogram.types import Message
 
@@ -160,7 +161,16 @@ async def cmd_add_intent(message: Message, command: CommandObject, pool: asyncpg
     if await pool.fetchval("SELECT 1 FROM intents WHERE code = $1", code):
         await message.answer("Интент с таким кодом уже есть.")
         return
-    topic = await bot.create_forum_topic(chat_id=settings.forum_chat_id, name=title)
+    try:
+        topic = await bot.create_forum_topic(chat_id=settings.forum_chat_id, name=title)
+    except TelegramBadRequest as exc:
+        await message.answer(
+            "⚠️ Не смог создать топик в форум-группе: "
+            f"<code>{html.escape(exc.message)}</code>\n\n"
+            "Проверь: 1) в группе включены Topics; 2) бот — админ с правом "
+            "«Управление темами». Потом повтори команду."
+        )
+        return
     await pool.execute(
         "INSERT INTO intents (code, title, topic_id) VALUES ($1, $2, $3)",
         code,
