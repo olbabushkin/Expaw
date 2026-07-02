@@ -94,7 +94,8 @@ async def cmd_start(message: Message):
         "/set_prefilter &lt;code&gt; слово1, слово2, /regex/ — префильтр вручную\n"
         "/suggest_prefilter &lt;code&gt; — перегенерировать префильтр через LLM\n"
         "/set_threshold &lt;code&gt; &lt;0..1&gt;\n"
-        "/toggle_intent &lt;code&gt;\n"
+        "/toggle_intent &lt;code&gt; — вкл/выкл интент\n"
+        "/remove_intent &lt;code&gt; — удалить интент вместе с топиком\n"
         "/list_intents\n"
         "/tune_prompt &lt;code&gt; — улучшить критерии по реакциям 👍/👎 на посты\n"
         "/recalc — пересчитать все сообщения под новые промпты\n"
@@ -302,6 +303,55 @@ async def _generate_prefilter(message: Message, pool: asyncpg.Pool, code: str) -
         f"Поправить вручную: /set_prefilter {code} ...\n"
         f"Перегенерировать: /suggest_prefilter {code}"
     )
+
+
+@router.message(Command("remove_intent"))
+async def cmd_remove_intent(message: Message, command: CommandObject, pool: asyncpg.Pool, bot: Bot):
+    parts = (command.args or "").split()
+    code = parts[0].lower() if parts else ""
+    if not code:
+        await message.answer("Использование: /remove_intent <code>")
+        return
+    intent = await pool.fetchrow(
+        "SELECT id, title, topic_id FROM intents WHERE code = $1", code
+    )
+    if intent is None:
+        await message.answer("Интент не найден.")
+        return
+    if len(parts) < 2 or parts[1] != "confirm":
+        counts = await pool.fetchrow(
+            """
+            SELECT (SELECT count(*) FROM matches WHERE intent_id = $1) AS matches,
+                   (SELECT count(*) FROM feedback WHERE intent_id = $1) AS feedback
+            """,
+            intent["id"],
+        )
+        await message.answer(
+            f"Удалю интент <b>{html.escape(code)}</b> («{html.escape(intent['title'])}»), "
+            f"его топик в форуме со всеми постами, {counts['matches']} совпадений и "
+            f"{counts['feedback']} отметок 👍/👎. Сами сообщения из чатов останутся.\n\n"
+            f"Если нужно просто выключить — /toggle_intent {code}.\n"
+            f"Подтверждение: <code>/remove_intent {code} confirm</code>"
+        )
+        return
+    if intent["topic_id"]:
+        try:
+            await bot.delete_forum_topic(
+                chat_id=settings.forum_chat_id, message_thread_id=intent["topic_id"]
+            )
+        except TelegramBadRequest as exc:
+            # нет права can_delete_messages или топик уже удалён руками — не блокируем
+            await message.answer(
+                f"⚠️ Топик удалить не смог ({html.escape(exc.message)}) — удали руками. "
+                "Продолжаю удалять интент."
+            )
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("DELETE FROM feedback WHERE intent_id = $1", intent["id"])
+            await conn.execute("DELETE FROM matches WHERE intent_id = $1", intent["id"])
+            await conn.execute("DELETE FROM intents WHERE id = $1", intent["id"])
+    await db.audit(pool, message.from_user.id, "remove_intent", {"code": code})
+    await message.answer(f"🗑 Интент <b>{html.escape(code)}</b> удалён вместе с топиком.")
 
 
 @router.message(Command("set_prompt"))

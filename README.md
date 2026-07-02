@@ -94,6 +94,7 @@ rsync их исключает. Миграции применяются авто�
 | `/suggest_prefilter dog_boarding` | перегенерировать префильтр через LLM |
 | `/set_threshold dog_boarding 0.75` | порог уверенности |
 | `/toggle_intent`, `/list_intents` | управление интентами |
+| `/remove_intent <code>` → `... confirm` | удалить интент вместе с топиком и его данными |
 | `/tune_prompt dog_boarding` | улучшить критерии по реакциям 👍/👎 |
 | `/recalc` → `/recalc confirm` | пересчитать всё под новые промпты (посты пересоздаются) |
 | `/stats` | сообщения/совпадения за сутки, % дошедших до LLM |
