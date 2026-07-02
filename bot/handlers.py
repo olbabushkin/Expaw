@@ -9,6 +9,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject
 from aiogram.types import Message
 
+from bot.keywords import suggest_keywords
 from common import db
 from common.config import settings
 
@@ -49,8 +50,9 @@ async def cmd_start(message: Message):
         "/remove_chat &lt;@username|id&gt; — убрать чат\n"
         "/list_chats — список чатов\n"
         "/add_intent &lt;code&gt; &lt;название&gt; — создать интент (+топик)\n"
-        "/set_prompt &lt;code&gt; &lt;текст&gt; — критерии для LLM\n"
-        "/set_prefilter &lt;code&gt; слово1, слово2, /regex/ — префильтр\n"
+        "/set_prompt &lt;code&gt; &lt;текст&gt; — критерии для LLM (префильтр подберётся сам)\n"
+        "/set_prefilter &lt;code&gt; слово1, слово2, /regex/ — префильтр вручную\n"
+        "/suggest_prefilter &lt;code&gt; — перегенерировать префильтр через LLM\n"
         "/set_threshold &lt;code&gt; &lt;0..1&gt;\n"
         "/toggle_intent &lt;code&gt;\n"
         "/list_intents\n"
@@ -184,20 +186,68 @@ async def cmd_add_intent(message: Message, command: CommandObject, pool: asyncpg
     )
 
 
+async def _generate_prefilter(message: Message, pool: asyncpg.Pool, code: str) -> None:
+    """Подбирает ключевые слова префильтра по критериям интента через LLM."""
+    row = await pool.fetchrow("SELECT title, llm_prompt FROM intents WHERE code = $1", code)
+    try:
+        keywords = await suggest_keywords(row["title"], row["llm_prompt"])
+    except Exception as exc:  # noqa: BLE001 — ошибка API не должна ломать команду
+        await message.answer(
+            f"⚠️ Не удалось подобрать ключевые слова ({html.escape(str(exc)[:100])}). "
+            f"Задай вручную: /set_prefilter {code} слово1, слово2"
+        )
+        return
+    await pool.execute("UPDATE intents SET prefilter = $2 WHERE code = $1", code, keywords)
+    await message.answer(
+        f"🔑 Префильтр подобран автоматически ({len(keywords)} шаблонов):\n"
+        f"<code>{html.escape(', '.join(keywords))}</code>\n\n"
+        f"Поправить вручную: /set_prefilter {code} ...\n"
+        f"Перегенерировать: /suggest_prefilter {code}"
+    )
+
+
 @router.message(Command("set_prompt"))
 async def cmd_set_prompt(message: Message, command: CommandObject, pool: asyncpg.Pool):
     parts = (command.args or "").split(maxsplit=1)
     if len(parts) < 2:
         await message.answer("Использование: /set_prompt <code> <критерии интента для LLM>")
         return
-    updated = await pool.execute(
-        "UPDATE intents SET llm_prompt = $2 WHERE code = $1", parts[0].lower(), parts[1]
+    code = parts[0].lower()
+    row = await pool.fetchrow(
+        "UPDATE intents SET llm_prompt = $2 WHERE code = $1 RETURNING prefilter",
+        code,
+        parts[1],
     )
-    if updated == "UPDATE 0":
+    if row is None:
         await message.answer("Интент не найден.")
         return
-    await db.audit(pool, message.from_user.id, "set_prompt", {"code": parts[0]})
-    await message.answer("Промпт сохранён.")
+    await db.audit(pool, message.from_user.id, "set_prompt", {"code": code})
+    if row["prefilter"]:
+        await message.answer(
+            f"Промпт сохранён. Префильтр уже настроен; перегенерировать по новым "
+            f"критериям: /suggest_prefilter {code}"
+        )
+        return
+    await message.answer("Промпт сохранён. Подбираю ключевые слова для префильтра…")
+    await _generate_prefilter(message, pool, code)
+
+
+@router.message(Command("suggest_prefilter"))
+async def cmd_suggest_prefilter(message: Message, command: CommandObject, pool: asyncpg.Pool):
+    code = (command.args or "").strip().lower()
+    if not code:
+        await message.answer("Использование: /suggest_prefilter <code>")
+        return
+    row = await pool.fetchrow("SELECT llm_prompt FROM intents WHERE code = $1", code)
+    if row is None:
+        await message.answer("Интент не найден.")
+        return
+    if not row["llm_prompt"]:
+        await message.answer(f"Сначала задай критерии: /set_prompt {code} ...")
+        return
+    await db.audit(pool, message.from_user.id, "suggest_prefilter", {"code": code})
+    await message.answer("Подбираю ключевые слова…")
+    await _generate_prefilter(message, pool, code)
 
 
 @router.message(Command("set_prefilter"))
