@@ -64,10 +64,12 @@ async def classify(text: str, intents: list[dict]) -> dict:
 
     response = await _client.messages.create(
         model=settings.llm_model,
-        max_tokens=1024,
+        max_tokens=2000,
         system=_SYSTEM,
         messages=[{"role": "user", "content": build_user_prompt(text, intents)}],
         output_config={"format": {"type": "json_schema", "schema": _SCHEMA}},
     )
+    if response.stop_reason == "max_tokens":
+        raise RuntimeError("ответ LLM обрезан по max_tokens")
     raw = next(b.text for b in response.content if b.type == "text")
     return json.loads(raw)

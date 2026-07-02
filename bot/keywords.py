@@ -9,6 +9,13 @@ from common.textutils import normalize
 
 _client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key, max_retries=2)
 
+
+def _text(response) -> str:
+    """Текст ответа с защитой от обрезания: усечённый JSON не парсится."""
+    if response.stop_reason == "max_tokens":
+        raise RuntimeError("ответ LLM обрезан по max_tokens")
+    return next(b.text for b in response.content if b.type == "text")
+
 _SCHEMA = {
     "type": "object",
     "properties": {
@@ -67,19 +74,18 @@ async def improve_prompt(
     )
     response = await _client.messages.create(
         model=settings.llm_model,
-        max_tokens=800,
+        max_tokens=2000,
         system=_TUNE_SYSTEM,
         messages=[{"role": "user", "content": user}],
         output_config={"format": {"type": "json_schema", "schema": _TUNE_SCHEMA}},
     )
-    raw = next(b.text for b in response.content if b.type == "text")
-    return json.loads(raw)["prompt"].strip()
+    return json.loads(_text(response))["prompt"].strip()
 
 
 async def suggest_keywords(title: str, criteria: str) -> list[str]:
     response = await _client.messages.create(
         model=settings.llm_model,
-        max_tokens=500,
+        max_tokens=2000,
         system=_SYSTEM,
         messages=[
             {
@@ -89,8 +95,7 @@ async def suggest_keywords(title: str, criteria: str) -> list[str]:
         ],
         output_config={"format": {"type": "json_schema", "schema": _SCHEMA}},
     )
-    raw = next(b.text for b in response.content if b.type == "text")
-    keywords = json.loads(raw)["keywords"]
+    keywords = json.loads(_text(response))["keywords"]
     # нормализуем так же, как текст сообщений при матчинге, и убираем дубли
     seen: dict[str, None] = {}
     for kw in keywords:
