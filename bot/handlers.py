@@ -10,7 +10,8 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject
 from aiogram.types import Message, MessageReactionUpdated
 
-from bot.keywords import improve_prompt, suggest_keywords
+from bot.keywords import suggest_keywords
+from bot.tuning import maybe_autotune, run_tune
 from common import db
 from common.config import settings
 from common.log import setup
@@ -62,6 +63,8 @@ async def on_reaction(event: MessageReactionUpdated, pool: asyncpg.Pool):
         verdict,
         event.user.id if event.user else None,
     )
+    # каждые N новых реакций — автотюнинг промпта и префильтра (фоном)
+    asyncio.create_task(maybe_autotune(pool, match["intent_id"]))
 
 
 _INVITE_RE = re.compile(r"(?:t\.me/(?:joinchat/|\+))([\w-]+)$")
@@ -97,12 +100,13 @@ async def cmd_start(message: Message):
         "/toggle_intent &lt;code&gt; — вкл/выкл интент\n"
         "/remove_intent &lt;code&gt; — удалить интент вместе с топиком\n"
         "/list_intents\n"
-        "/tune_prompt &lt;code&gt; — улучшить критерии по реакциям 👍/👎 на посты\n"
+        "/tune_prompt &lt;code&gt; — улучшить критерии и префильтр по реакциям 👍/👎\n"
         "/recalc — пересчитать все сообщения под новые промпты\n"
         "/stats — статистика за сутки\n"
         "/retry_errors — перезапустить сообщения со статусом error\n\n"
         "Реакции в топиках: 👍 на пост = совпадение верное, 👎 = ложное. "
-        "Это копится как обучающая выборка для /tune_prompt."
+        "Каждые 5 реакций по интенту автотюнинг запускается сам (отчёт — "
+        "в топик «Система»)."
     )
 
 
@@ -511,7 +515,7 @@ async def cmd_tune_prompt(message: Message, command: CommandObject, pool: asyncp
         await message.answer("Использование: /tune_prompt <code>")
         return
     intent = await pool.fetchrow(
-        "SELECT id, title, llm_prompt FROM intents WHERE code = $1", code
+        "SELECT id, code, title, llm_prompt, prefilter FROM intents WHERE code = $1", code
     )
     if intent is None:
         await message.answer("Интент не найден.")
@@ -519,44 +523,34 @@ async def cmd_tune_prompt(message: Message, command: CommandObject, pool: asyncp
     if not intent["llm_prompt"]:
         await message.answer(f"Сначала задай критерии: /set_prompt {code} ...")
         return
-    rows = await pool.fetch(
-        """
-        SELECT f.verdict, m.text FROM feedback f
-        JOIN messages m ON m.id = f.message_id
-        WHERE f.intent_id = $1 AND m.text IS NOT NULL AND m.text != ''
-        ORDER BY f.created_at DESC LIMIT 30
-        """,
-        intent["id"],
-    )
-    false_positives = [r["text"] for r in rows if r["verdict"] == -1]
-    confirmed = [r["text"] for r in rows if r["verdict"] == 1]
-    if not false_positives and not confirmed:
+    await message.answer("Улучшаю критерии и префильтр по фидбеку…")
+    try:
+        res = await run_tune(pool, intent)
+    except ValueError:
         await message.answer(
             "Пока нет обратной связи. Ставь 👍 на верные посты и 👎 на ложные "
             "срабатывания прямо в топиках — потом повтори команду."
         )
         return
-    await message.answer(
-        f"Улучшаю критерии по фидбеку: 👍 {len(confirmed)} · 👎 {len(false_positives)}…"
-    )
-    try:
-        new_prompt = await improve_prompt(
-            intent["title"], intent["llm_prompt"], false_positives, confirmed
-        )
     except Exception as exc:  # noqa: BLE001
-        log.exception("improve_prompt failed")
+        log.exception("tune failed")
         await message.answer(f"⚠️ Не получилось: {html.escape(str(exc)[:100])}")
         return
-    await pool.execute(
-        "UPDATE intents SET llm_prompt = $2 WHERE id = $1", intent["id"], new_prompt
-    )
     await db.audit(pool, message.from_user.id, "tune_prompt", {"code": code})
+    added = ", ".join(res["added"]) if res["added"] else "без изменений"
+    warn = (
+        f"\n⚠️ {res['uncovered']} подтверждённых сообщений не покрыты префильтром — "
+        f"добавь основу вручную: /set_prefilter {code} ..."
+        if res["uncovered"]
+        else ""
+    )
     await message.answer(
-        f"✅ Критерии обновлены:\n\n<i>{html.escape(new_prompt)}</i>\n\n"
-        f"Дальше по желанию:\n"
-        f"/suggest_prefilter {code} — обновить ключевые слова\n"
-        f"/recalc — пересчитать все сообщения под новые критерии\n"
-        f"Откатить/поправить: /set_prompt {code} ..."
+        f"✅ По выборке 👍{res['likes']}/👎{res['dislikes']}:\n\n"
+        f"Критерии:\n<i>{html.escape(res['prompt'])}</i>\n\n"
+        f"Префильтр (+{len(res['added'])}, всего {res['total_prefilter']}): "
+        f"<code>{html.escape(added)}</code>{warn}\n\n"
+        f"/recalc — применить ко всем сообщениям\n"
+        f"Откатить критерии: /set_prompt {code} ..."
     )
 
 
