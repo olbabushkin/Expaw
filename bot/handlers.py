@@ -12,6 +12,9 @@ from aiogram.types import Message
 from bot.keywords import suggest_keywords
 from common import db
 from common.config import settings
+from common.log import setup
+
+log = setup("bot.handlers")
 
 router = Router()
 
@@ -192,6 +195,7 @@ async def _generate_prefilter(message: Message, pool: asyncpg.Pool, code: str) -
     try:
         keywords = await suggest_keywords(row["title"], row["llm_prompt"])
     except Exception as exc:  # noqa: BLE001 — ошибка API не должна ломать команду
+        log.exception("suggest_keywords failed")
         await message.answer(
             f"⚠️ Не удалось подобрать ключевые слова ({html.escape(str(exc)[:100])}). "
             f"Задай вручную: /set_prefilter {code} слово1, слово2"
