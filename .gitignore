@@ -1,7 +1,28 @@
+# Python
 __pycache__/
 *.pyc
+.venv/
+
+# Секреты и локальная конфигурация (любые варианты .env, кроме шаблона)
 .env
-data/
+.env.*
+!.env.example
+
+# Сессии Telegram (= auth-токены аккаунта)
 *.session
 *.session-journal
-.venv/
+
+# Данные (БД Postgres, сессии, кэш)
+data/
+
+# Дампы БД — внутри тексты сообщений из чатов (PII).
+# Легитимные .sql лежат только в db/migrations/, поэтому корневые .sql — под игнор.
+/*.sql
+*.dump
+*.sql.gz
+
+# Типовые секретохранилища
+secrets*.json
+credentials*.json
+*.pem
+*.key
